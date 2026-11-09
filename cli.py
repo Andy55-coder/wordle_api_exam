@@ -4,7 +4,7 @@ import pygame
 import requests
 
 # API 設定（指向你的 Render 雲端網址）
-API_BASE_URL = "https://wordle-api-exam.onrender.com"
+API_BASE_URL = "https://wordle-api-exam-2.onrender.com"
 
 # 顏色定義
 COLOR_BG = (18, 18, 19)
