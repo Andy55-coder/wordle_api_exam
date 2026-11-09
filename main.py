@@ -1,15 +1,13 @@
 import os
 import random
 import uuid
-from typing import Dict
-from fastapi import FastAPI, HTTPException
+from typing import Dict, List, Optional
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Wordle API Server")
 
-# 目前 client 是桌面程式，不受瀏覽器 CORS 限制。若日後改成網頁，
-# 再把 allow_origins 限定為實際前端網址。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 豐富的單字庫
 WORD_BANK = [
     "APPLE", "TRAIN", "HOUSE", "PLANT", "SMART", "WORLD", "LIGHT", "BRAIN", "CLOUD", "WATER",
     "ABOUT", "ABOVE", "ACTOR", "ACUTE", "ADMIT", "ADOPT", "ADULT", "AFTER", "AGAIN", "AGENT",
@@ -43,9 +40,14 @@ WORD_BANK = [
     "MEDAL", "MONEY", "MONTH", "MUSIC", "NIGHT", "NOVEL", "NURSE", "OCEAN", "OFFER", "ORDER"
 ]
 
-# 記憶體儲存遊戲狀態：{game_id: {"target": "APPLE", "status": "PLAYING"}}
+# 遊戲狀態儲存
 games_db: Dict[str, dict] = {}
-MAX_STORED_GAMES = 1000  # 防止記憶體過載的上限
+
+# 任務三：全域勝率統計數據
+global_stats = {
+    "total_games": 0,
+    "wins": 0
+}
 
 class GuessRequest(BaseModel):
     game_id: str
@@ -53,72 +55,110 @@ class GuessRequest(BaseModel):
 
 
 @app.post("/api/new-game")
-def start_new_game():
-    """ 建立新一局遊戲，回傳 game_id """
-    global games_db
-    # 如果記憶體內遊戲太多，清空舊的一半避免記憶體洩漏
-    if len(games_db) > MAX_STORED_GAMES:
-        keys_to_remove = list(games_db.keys())[:500]
-        for k in keys_to_remove:
-            games_db.pop(k, None)
-
+def start_new_game(hard_mode: bool = Query(False)):
+    """任務一與四：建立新遊戲，支援 hard_mode 參數"""
+    global_stats["total_games"] += 1
+    
     game_id = str(uuid.uuid4())
     target_word = random.choice(WORD_BANK)
     games_db[game_id] = {
         "target": target_word,
-        "status": "PLAYING"
+        "status": "PLAYING",
+        "hard_mode": hard_mode,
+        "attempts": 0,
+        "history": [],  # 記錄已猜過的資訊供 Hard Mode 檢查
+        "revealed_correct": {}  # 紀錄位置固定正確的字母 {index: char}
     }
-    return {"game_id": game_id, "message": "New game started!"}
+    return {"game_id": game_id, "message": "New game started!", "hard_mode": hard_mode}
+
+
+@app.get("/api/stats")
+def get_stats():
+    """任務三：取得勝率統計 API"""
+    total = global_stats["total_games"]
+    wins = global_stats["wins"]
+    win_rate = round((wins / total * 100), 1) if total > 0 else 0.0
+    return {
+        "total_games": total,
+        "wins": wins,
+        "win_rate": win_rate
+    }
 
 
 @app.post("/api/guess")
 def process_guess(req: GuessRequest):
-    """ 接收玩家猜測，比對答案並回傳顏色結果 """
+    """任務一、二、四：驗證猜測、單字檢查、硬核模式判定"""
     game_id = req.game_id
     guess = req.guess.strip().upper()
 
     if game_id not in games_db:
-        raise HTTPException(status_code=404, detail="Game session not found or expired.")
+        raise HTTPException(status_code=404, detail="Game session not found.")
     
     if len(guess) != 5 or not guess.isalpha():
-        raise HTTPException(status_code=400, detail="Word must be exactly 5 English letters.")
+        raise HTTPException(status_code=400, detail="Word must be 5 letters.")
 
-    target = games_db[game_id]["target"]
-    feedback = ["absent"] * 5  # 預設灰色 absent
+    # 任務二：檢查單字是否在字典中
+    if guess not in WORD_BANK:
+        raise HTTPException(status_code=400, detail="Word not in dictionary")
+
+    game_data = games_db[game_id]
+    target = game_data["target"]
+    hard_mode = game_data["hard_mode"]
+    revealed_correct = game_data["revealed_correct"]
+
+    # 任務四：硬核模式驗證（必須維持先前確認為綠色的字母與位置）
+    if hard_mode:
+        for idx, char in revealed_correct.items():
+            if guess[idx] != char:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Hard Mode: Must use revealed hint at green position"
+                )
+
+    feedback = ["absent"] * 5
     target_letter_counts = {}
 
-    # 1. 先計算目標單字的各字母數量
     for char in target:
         target_letter_counts[char] = target_letter_counts.get(char, 0) + 1
 
-    # 2. 標記綠色 correct
+    # 1. 標記綠色 correct
     for i in range(5):
         if guess[i] == target[i]:
             feedback[i] = "correct"
             target_letter_counts[guess[i]] -= 1
+            revealed_correct[i] = guess[i]  # 記錄硬核模式提示
 
-    # 3. 標記黃色 present
+    # 2. 標記黃色 present
     for i in range(5):
         if feedback[i] != "correct" and guess[i] in target:
             if target_letter_counts.get(guess[i], 0) > 0:
                 feedback[i] = "present"
                 target_letter_counts[guess[i]] -= 1
 
-    # 檢查是否過關
+    game_data["attempts"] += 1
+    game_data["history"].append({"guess": guess, "feedback": feedback})
+
     is_correct = (guess == target)
+    is_game_over = is_correct or (game_data["attempts"] >= 6)
+
     if is_correct:
-        games_db[game_id]["status"] = "WON"
+        game_data["status"] = "WON"
+        global_stats["wins"] += 1
+
+    # 任務一：如果是第 6 次猜錯或贏了，回傳 target_word；否則回傳 None
+    response_target = target if is_game_over else None
 
     return {
         "guess": guess,
-        "feedback": feedback,  # 例如: ["correct", "present", "absent", "absent", "correct"]
+        "feedback": feedback,
         "is_correct": is_correct,
-        "target_word": target if is_correct else None  # 猜對才顯示
+        "is_game_over": is_game_over,
+        "target_word": response_target,
+        "attempts_left": 6 - game_data["attempts"]
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Render 會透過 PORT 環境變數指定服務埠；本機則預設使用 8000。
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
